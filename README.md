@@ -54,6 +54,6 @@ sudo bash panel-installer.sh --router-pub <ключ>
 
 | Файл | Назначение |
 |---|---|
-| `panel-installer.sh` | сам инсталлер (всё в одном) |
+| [`panel-installer.sh`](../../releases/download/v1.0/panel-installer.sh) | сам инсталлер (всё в одном) — скачивается из Releases |
 | `app.py` | исходник веб-панели |
 | `build-src/` | сборочные части: `part1.sh` + `part2.sh` + `builder.sh` — как пересобрать инсталлер из свежего `app.py` |
