@@ -791,6 +791,18 @@ a.dl:hover{text-decoration:underline}
 </div>
 
 <div class="card">
+  <h2>Автоподбор</h2>
+  <div id="sbinfo" class="host" style="margin-bottom:10px">загрузка…</div>
+  <div class="mrow">
+    <input id="sbinterval" class="full" inputmode="numeric" placeholder="Интервал опроса, сек (10–3600)">
+    <input id="sbtolerance" class="full" inputmode="numeric" placeholder="Tolerance, мс (0–1000)">
+    <button class="primary" onclick="sbsave()">Сохранить</button>
+  </div>
+  <div class="hint">Опрос каждые N секунд выбирает самый быстрый сервер. Tolerance — минимальный выигрыш (мс), при котором произойдёт переключение.</div>
+  <div id="sbmsg" style="font-size:13px;min-height:18px;margin-top:8px"></div>
+</div>
+
+<div class="card">
   <h2>WireGuard</h2>
   <div id="wginfo" class="host" style="margin-bottom:10px">загрузка…</div>
   <div id="wglist"></div>
@@ -879,6 +891,19 @@ async function subinit() {
   if (d.ok && d.url) $('suburl').value = d.url;
 }
 
+async function sbload() {
+  const d = await api('/api/sb');
+  if (!d.ok) { $('sbinfo').textContent = d.error || 'ошибка'; return; }
+  $('sbinfo').textContent = 'Серверов в автоподборе: ' + d.count + ' · сейчас: ' + (d.now || '—');
+  if (document.activeElement !== $('sbinterval')) $('sbinterval').value = d.interval;
+  if (document.activeElement !== $('sbtolerance')) $('sbtolerance').value = d.tolerance;
+}
+async function sbsave() {
+  const r = await api('/api/sb/settings', {interval: parseInt($('sbinterval').value, 10), tolerance: parseInt($('sbtolerance').value, 10)});
+  say('sbmsg', r.ok ? 'Сохранено, sing-box перезапущен' : (r.error || 'ошибка'), r.ok ? 'good' : 'err');
+  sbload();
+}
+
 async function wgload() {
   const d = await api('/api/wg');
   if (!d.ok) { $('wginfo').textContent = d.error || 'ошибка'; return; }
@@ -910,7 +935,7 @@ async function chpw() {
   else say('pwmsg', r.error, 'err');
 }
 async function logout() { await fetch('/api/logout', {method:'POST'}); location.href = '/'; }
-load(); wgload(); subinit(); setInterval(() => { load(); wgload(); }, 15000);
+load(); wgload(); subinit(); sbload(); setInterval(() => { load(); wgload(); sbload(); }, 15000);
 </script></body></html>
 """
 
@@ -951,6 +976,8 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/sub":
             m = meta_load()
             return self._json({"ok": True, "url": m.get("url", ""), "updated": m.get("updated", 0)})
+        if u.path == "/api/sb":
+            return self._json(self.sb_info())
         if u.path == "/api/wg/config":
             pub = urllib.parse.parse_qs(u.query).get("p", [""])[0]
             pub = pub.replace(" ", "+")
@@ -994,6 +1021,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/wg/add": self.wg_add_ep,
             "/api/wg/delete": self.wg_del_ep,
             "/api/wg/settings": self.wg_settings_ep,
+            "/api/sb/settings": self.sb_settings_ep,
             "/api/password": self.password_ep,
         }
         fn = routes.get(self.path)
@@ -1125,6 +1153,38 @@ class Handler(BaseHTTPRequestHandler):
 
     def wg_del_ep(self, body):
         return wg_delete(body.get("pubkey"))
+
+    def sb_info(self):
+        ut = urltest(load())
+        if not ut:
+            return {"ok": False, "error": "urltest не найден в конфиге"}
+        m = re.match(r"^(\d+)(s|m)?$", str(ut.get("interval", "30s")))
+        secs = int(m.group(1)) * (60 if (m.group(2) or "s") == "m" else 1) if m else 30
+        tol = int(ut.get("tolerance", 50))
+        auto = clash("/proxies/auto") or {}
+        return {"ok": True, "interval": secs, "tolerance": tol,
+                "count": len(ut.get("outbounds", [])), "now": auto.get("now", "")}
+
+    def sb_settings_ep(self, body):
+        try:
+            iv = int(body.get("interval"))
+            tol = int(body.get("tolerance"))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "нужны числа"}
+        if not (10 <= iv <= 3600):
+            return {"ok": False, "error": "интервал должен быть 10–3600 сек"}
+        if not (0 <= tol <= 1000):
+            return {"ok": False, "error": "tolerance должен быть 0–1000 мс"}
+        d = load()
+        ut = urltest(d)
+        if not ut:
+            return {"ok": False, "error": "urltest не найден в конфиге"}
+        ut["interval"] = "%ds" % iv
+        ut["tolerance"] = tol
+        res = apply(d)
+        if not res.get("ok"):
+            return res
+        return {"ok": True, "interval": iv, "tolerance": tol}
 
     def wg_settings_ep(self, body):
         ep = (body.get("endpoint") or "").strip()
