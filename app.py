@@ -725,7 +725,7 @@ def wg_run(args, data=None):
 
 
 def wg_settings():
-    default = {"endpoint": "192.168.0.101:29687"}
+    default = {"endpoint": "192.0.2.10:29687"}
     if os.path.exists(WG_SETTINGS):
         try:
             with open(WG_SETTINGS) as f:
@@ -1040,7 +1040,7 @@ a.dl:hover{text-decoration:underline}
     <button class="primary" onclick="wgadd()">Добавить пир</button>
   </div>
   <div class="mrow">
-    <input id="wgendpoint" class="full" placeholder="Адрес сервера для конфига, e.g. 192.168.0.101:29687">
+    <input id="wgendpoint" class="full" placeholder="Адрес сервера для конфига, e.g. 192.0.2.10:29687">
     <button onclick="wgsave()">Сохранить адрес</button>
   </div>
   <div class="hint">Конфиг — обычный .conf для WireGuard. Кнопка «конфиг» скачивает файл.</div>
