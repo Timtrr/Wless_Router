@@ -132,7 +132,7 @@ def clash(path):
 
 
 def proxy_outbounds(d):
-    return [o for o in d.get("outbounds", []) if o.get("type") not in ("urltest", "direct", "block", "selector")]
+    return [o for o in d.get("outbounds", []) if o.get("type") not in ("urltest", "block", "selector")]
 
 
 def urltest(d):
@@ -183,7 +183,13 @@ def parse_vless(link):
     if sec in ("reality", "tls"):
         tls = {"enabled": True, "server_name": q.get("sni", host)}
         if q.get("fp"):
-            tls["utls"] = {"enabled": True, "fingerprint": q["fp"]}
+            fp = q["fp"].strip().lower()
+            m = re.match(r"^hello([a-z]+?)(?:_\d+)?$", fp)
+            if m:
+                fp = m.group(1)
+            if fp not in ("chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized"):
+                fp = "chrome"
+            tls["utls"] = {"enabled": True, "fingerprint": fp}
         if sec == "reality":
             tls["reality"] = {"enabled": True, "public_key": q.get("pbk", ""), "short_id": q.get("sid", "")}
         if q.get("alpn"):
@@ -207,7 +213,13 @@ def parse_trojan(link):
           "password": urllib.parse.unquote(u.username or "")}
     tls = {"enabled": True, "server_name": q.get("sni", host)}
     if q.get("fp"):
-        tls["utls"] = {"enabled": True, "fingerprint": q["fp"]}
+        fp = q["fp"].strip().lower()
+        m = re.match(r"^hello([a-z]+?)(?:_\d+)?$", fp)
+        if m:
+            fp = m.group(1)
+        if fp not in ("chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized"):
+            fp = "chrome"
+        tls["utls"] = {"enabled": True, "fingerprint": fp}
     if q.get("alpn"):
         tls["alpn"] = q["alpn"].split(",")
     ob["tls"] = tls
@@ -485,7 +497,7 @@ def sync_subscription(url, skip_dead=False):
         if tags_meta[t].get("sub") and t not in sub_tags:
             tags_meta.pop(t, None)
 
-    manual = [o for t, o in old.items() if not tags_meta.get(t, {}).get("sub")]
+    manual = [o for t, o in old.items() if not tags_meta.get(t, {}).get("sub") and t != AWG_TAG]
     others = [o for o in d["outbounds"] if o.get("type") in ("urltest", "direct", "block", "selector", "dns")]
 
     enabled = []
@@ -529,6 +541,181 @@ def sync_subscription(url, skip_dead=False):
         res["unsupported"] = unsupported
     return res
 
+
+
+
+
+# ---------------------------------------------------------------- priority
+
+AWG_TAG = "amnezia-vm"
+import threading
+
+_AWG_FAILS = 0
+
+
+def selector_ob(d):
+    for o in d.get("outbounds", []):
+        if o.get("type") == "selector":
+            return o
+    return None
+
+
+def _clash_switch(name):
+    try:
+        req = urllib.request.Request(CLASH + "/proxies/auto",
+                                     data=json.dumps({"name": name}).encode(),
+                                     headers={"Content-Type": "application/json"}, method="PUT")
+        urllib.request.urlopen(req, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def priority_tick():
+    global _AWG_FAILS
+    try:
+        d = load()
+        sel = selector_ob(d)
+        if not sel or sel.get("tag") != "auto":
+            return
+        mode = (meta_load().get("priority") or "server")
+        cur = (clash("/proxies/auto") or {}).get("now", "")
+        awg_delay = probe(AWG_TAG, timeout=5)
+        tol = 100
+        ut = urltest(d)
+        if ut:
+            try:
+                tol = int(ut.get("tolerance", 100))
+            except Exception:
+                tol = 100
+        if mode == "server":
+            if awg_delay:
+                _AWG_FAILS = 0
+                if cur != AWG_TAG:
+                    _clash_switch(AWG_TAG)
+            else:
+                _AWG_FAILS += 1
+                if _AWG_FAILS >= 2 and cur != "reserve":
+                    _clash_switch("reserve")
+        else:
+            rd = probe("reserve", timeout=5)
+            if awg_delay and rd:
+                if cur == "reserve" and awg_delay + tol <= rd:
+                    _clash_switch(AWG_TAG)
+                elif cur != "reserve" and rd + tol < awg_delay:
+                    _clash_switch("reserve")
+            elif awg_delay and not rd:
+                if cur != "reserve":
+                    _clash_switch("reserve")
+            elif not awg_delay and cur != "reserve":
+                _clash_switch("reserve")
+    except Exception:
+        pass
+
+
+def priority_loop():
+    while True:
+        priority_tick()
+        time.sleep(30)
+
+
+def priority_mode():
+    return meta_load().get("priority") or "server"
+
+
+def priority_set(mode):
+    if mode not in ("server", "fastest"):
+        return {"ok": False, "error": "режим: server или fastest"}
+    m = meta_load()
+    m["priority"] = mode
+    meta_save(m)
+    priority_tick()
+    return {"ok": True, "mode": mode}
+
+
+# ---------------------------------------------------------------- amnezia (awg client)
+
+AWG_CONF = "/etc/amnezia/amneziawg/awg0.conf"
+AWG_IF = "awg0"
+AWG_SVC = "amnezia-vm.service"
+AWG_TOOL = "/usr/local/bin/awg"
+
+
+def _awg_svc(action):
+    r = subprocess.run(["systemctl", action, AWG_SVC], capture_output=True, text=True)
+    return r.returncode == 0, (r.stderr or r.stdout).strip()[:300]
+
+
+def awg_status():
+    active = subprocess.run(["systemctl", "is-active", AWG_SVC],
+                            capture_output=True, text=True).stdout.strip() == "active"
+    out = {"active": active}
+    if active:
+        r = subprocess.run([AWG_TOOL, "show", AWG_IF], capture_output=True, text=True)
+        t = r.stdout
+        m = re.search(r"(?m)^  latest handshake:\s*(.+)$", t)
+        if m:
+            out["handshake"] = m.group(1).strip()
+        m = re.search(r"(?m)^  transfer:\s*(.+)$", t)
+        if m:
+            rx = re.search(r"([\d.]+ \w+) received", m.group(1))
+            tx = re.search(r"([\d.]+ \w+) sent", m.group(1))
+            out["rx"] = rx.group(1) if rx else ""
+            out["tx"] = tx.group(1) if tx else ""
+        m = re.search(r"(?m)^  endpoint:\s*(\S+)", t)
+        if m:
+            out["endpoint"] = m.group(1)
+    px = clash("/proxies/amnezia-vm") or {}
+    hist = px.get("history") or []
+    if hist:
+        out["delay"] = hist[-1].get("delay")
+    return out
+
+
+def awg_conf_text():
+    if os.path.exists(AWG_CONF):
+        with open(AWG_CONF) as f:
+            return f.read()
+    return ""
+
+
+def awg_apply(text):
+    text = (text or "").replace("\r\n", "\n").strip() + "\n"
+    if "[Interface]" not in text or "[Peer]" not in text:
+        return {"ok": False, "error": "в конфиге должны быть секции [Interface] и [Peer]"}
+    if not re.search(r"(?mi)^PrivateKey\s*=", text):
+        return {"ok": False, "error": "нет PrivateKey в [Interface]"}
+    if not re.search(r"(?mi)^PublicKey\s*=", text):
+        return {"ok": False, "error": "нет PublicKey в [Peer]"}
+    if not re.search(r"(?mi)^Endpoint\s*=", text):
+        return {"ok": False, "error": "нет Endpoint в [Peer]"}
+    fixed = False
+    if not re.search(r"(?mi)^Table\s*=\s*off\s*$", text):
+        head, sep, rest = text.partition("[Peer]")
+        if not sep:
+            return {"ok": False, "error": "не найдена секция [Peer]"}
+        head = head.rstrip() + "\nTable = off\n\n"
+        text = head + sep + rest
+        fixed = True
+    with open(AWG_CONF + ".bak", "w") as f:
+        f.write(awg_conf_text())
+    with open(AWG_CONF, "w") as f:
+        f.write(text)
+    os.chmod(AWG_CONF, 0o600)
+    ok, err = _awg_svc("restart")
+    if not ok:
+        return {"ok": False, "error": "перезапуск amnezia-vm: " + err}
+    time.sleep(5)
+    st = awg_status()
+    if st.get("active") and st.get("handshake"):
+        msg = "туннель переподключён, handshake есть"
+    elif st.get("active"):
+        msg = "туннель поднят, handshake ещё не пришёл (сервер недоступен?)"
+    else:
+        msg = "туннель не поднялся"
+    if fixed:
+        msg += " (Table = off добавлен автоматически)"
+    return {"ok": True, "status": msg}
 
 
 # ---------------------------------------------------------------- wireguard
@@ -768,6 +955,25 @@ a.dl:hover{text-decoration:underline}
 <h1>VPN</h1>
 <div class="sub">Балансировщик серверов и WireGuard-сервер</div>
 
+<div class="mrow" style="margin-bottom:14px">
+  <button id="tabbtn-home" class="primary" onclick="showTab('home')">Главная</button>
+  <button id="tabbtn-settings" onclick="showTab('settings')">Настройки</button>
+</div>
+
+<div id="tab-home">
+<div class="card">
+  <h2>Сейчас работает</h2>
+  <div id="homenow" class="host" style="font-size:15px;margin-bottom:8px">загрузка…</div>
+  <div class="hint">Режим: <span id="homemode">…</span></div>
+</div>
+<div class="card">
+  <h2>Туннель Amnezia</h2>
+  <div id="homeawg" class="host">загрузка…</div>
+</div>
+</div>
+
+<div id="tab-settings" style="display:none">
+
 <div class="card">
   <h2>Подписка</h2>
   <div class="mrow" style="margin-top:0">
@@ -803,6 +1009,29 @@ a.dl:hover{text-decoration:underline}
 </div>
 
 <div class="card">
+  <h2>Приоритет</h2>
+  <div id="prioinfo" class="host" style="margin-bottom:10px">загрузка…</div>
+  <div class="mrow">
+    <button class="primary" onclick="priosave('server')">Мой сервер — приоритет</button>
+    <button onclick="priosave('fastest')">Кто быстрее</button>
+  </div>
+  <div class="hint">«Мой сервер — приоритет»: трафик идёт через твой сервер, при его недоступности — автоматом резервные, при восстановлении — возврат. «Кто быстрее»: выбирается минимальный пинг среди всех узлов.</div>
+  <div id="priomsg" style="font-size:13px;min-height:18px;margin-top:8px"></div>
+</div>
+
+<div class="card">
+  <h2>Amnezia</h2>
+  <div id="awginfo" class="host" style="margin-bottom:10px">загрузка…</div>
+  <textarea id="awgconf" rows="10" spellcheck="false" style="width:100%;font-family:monospace;font-size:12px"></textarea>
+  <div class="mrow" style="margin-top:10px">
+    <button class="primary" onclick="awgapply()">Применить и переподключить</button>
+    <button onclick="awgrestart()">Перезапустить туннель</button>
+  </div>
+  <div class="hint">Конфиг туннеля AmneziaWG (awg0.conf). Вставь сюда конфиг из приложения Amnezia, чтобы сменить ключи, сервер или порт. «Применить» переподнимает туннель (~5 сек).</div>
+  <div id="awgmsg" style="font-size:13px;min-height:18px;margin-top:8px"></div>
+</div>
+
+<div class="card">
   <h2>WireGuard</h2>
   <div id="wginfo" class="host" style="margin-bottom:10px">загрузка…</div>
   <div id="wglist"></div>
@@ -827,6 +1056,8 @@ a.dl:hover{text-decoration:underline}
     <button onclick="logout()">Выйти</button>
   </div>
   <div id="pwmsg" style="font-size:13px;min-height:18px;margin-top:8px"></div>
+</div>
+
 </div>
 </div>
 <script>
@@ -858,11 +1089,11 @@ async function load() {
   el.innerHTML = d.servers.map(s => `
     <div class="row">
       <div class="grow">
-        <div class="name">${s.name} ${s.active ? '<span class="pill act">активен</span>' : ''} ${s.enabled ? '' : '<span class="pill off">выкл</span>'}</div>
+        <div class="name">${s.name} ${s.awg ? '<span class="pill act">Amnezia · мой сервер</span>' : (s.active ? '<span class="pill act">активен</span>' : '')} ${s.enabled ? '' : '<span class="pill off">выкл</span>'}</div>
         <div class="host">${s.server}:${s.server_port} · ${s.delay ? s.delay + ' мс' : 'нет ответа'}</div>
       </div>
-      <label class="sw"><input type="checkbox" ${s.enabled ? 'checked' : ''} onchange="toggle('${s.tag}', this.checked)"><span class="sl"></span></label>
-      <button class="danger" onclick="del('${s.tag}')">✕</button>
+      ${s.awg ? '' : `<label class="sw"><input type="checkbox" ${s.enabled ? 'checked' : ''} onchange="toggle('${s.tag}', this.checked)"><span class="sl"></span></label>
+      <button class="danger" onclick="del('${s.tag}')">✕</button>`}
     </div>`).join('');
 }
 async function toggle(tag, on) { const r = await api('/api/toggle', {tag, enabled: on}); if (!r.ok) say('msg', r.error, 'err'); load(); }async function del(tag) { if (!confirm('Удалить ' + tag + '?')) return; const r = await api('/api/delete', {tag}); if (!r.ok) say('msg', r.error, 'err'); load(); }
@@ -929,13 +1160,65 @@ async function wgadd() {
 }
 async function wgdel(pub) { if (!confirm('Удалить пир?')) return; const r = await api('/api/wg/delete', {pubkey: pub}); if (!r.ok) say('wgmsg', r.error, 'err'); wgload(); }
 async function wgsave() { const r = await api('/api/wg/settings', {endpoint: $('wgendpoint').value.trim()}); say('wgmsg', r.ok ? 'Адрес сохранён' : r.error, r.ok ? 'good' : 'err'); }
+async function awgload() {
+  const d = await api('/api/awg');
+  const el = $('awginfo');
+  if (!d.ok) { el.textContent = d.error || 'ошибка'; return; }
+  const bits = [];
+  bits.push(d.active ? '<span class="pill act">туннель активен</span>' : '<span class="pill off">туннель выключен</span>');
+  if (d.endpoint) bits.push(d.endpoint);
+  bits.push(d.handshake ? 'handshake ' + d.handshake : 'нет handshake');
+  if (d.delay) bits.push(d.delay + ' мс');
+  if (d.rx || d.tx) bits.push('↓' + (d.rx || '0') + ' ↑' + (d.tx || '0'));
+  el.innerHTML = bits.join(' · ');
+  const ta = $('awgconf');
+  if (document.activeElement !== ta) ta.value = d.conf;
+}
+async function awgapply() {
+  say('awgmsg', 'Применяю…', '');
+  const r = await api('/api/awg/apply', {conf: $('awgconf').value});
+  say('awgmsg', r.ok ? 'OK: ' + r.status : r.error, r.ok ? 'good' : 'err');
+  awgload(); load();
+}
+async function awgrestart() {
+  say('awgmsg', 'Перезапускаю…', '');
+  const r = await api('/api/awg/restart', {});
+  say('awgmsg', r.ok ? 'OK: ' + r.status : r.error, r.ok ? 'good' : 'err');
+  awgload();
+}
+function showTab(t) {
+  $('tab-home').style.display = t == 'home' ? '' : 'none';
+  $('tab-settings').style.display = t == 'settings' ? '' : 'none';
+  $('tabbtn-home').className = t == 'home' ? 'primary' : '';
+  $('tabbtn-settings').className = t == 'settings' ? 'primary' : '';
+}
+async function homeload() {
+  const d = await api('/api/home');
+  if (!d.ok) { $('homenow').textContent = d.error || 'ошибка'; return; }
+  $('homenow').innerHTML = d.now_name + ' · ' + (d.now_delay ? d.now_delay + ' мс' : 'нет ответа');
+  $('homemode').textContent = d.mode == 'server' ? 'мой сервер — приоритет' : 'кто быстрее';
+  const a = d.awg || {};
+  $('homeawg').innerHTML = (a.active ? '<span class="pill act">туннель активен</span>' : '<span class="pill off">туннель выключен</span>')
+    + (a.endpoint ? ' · ' + a.endpoint : '')
+    + (a.handshake ? ' · handshake ' + a.handshake : ' · нет handshake')
+    + (a.delay ? ' · ' + a.delay + ' мс' : '')
+    + (d.nodes ? ' · узлов в панели: ' + d.nodes : '');
+  const pi = $('prioinfo');
+  if (pi) pi.innerHTML = 'Режим: <b>' + (d.mode == 'server' ? 'мой сервер — приоритет' : 'кто быстрее') + '</b> · сейчас: ' + d.now_name + (d.now_delay ? ' (' + d.now_delay + ' мс)' : '');
+}
+async function priosave(mode) {
+  say('priomsg', 'Сохраняю…', '');
+  const r = await api('/api/priority', {mode});
+  say('priomsg', r.ok ? 'Сохранено' : r.error, r.ok ? 'good' : 'err');
+  homeload(); load();
+}
 async function chpw() {
   const r = await api('/api/password', {old: $('oldpw').value, new: $('newpw').value});
   if (r.ok) { say('pwmsg', 'Пароль изменён, войдите заново', 'good'); setTimeout(() => location.href = '/', 1200); }
   else say('pwmsg', r.error, 'err');
 }
 async function logout() { await fetch('/api/logout', {method:'POST'}); location.href = '/'; }
-load(); wgload(); subinit(); sbload(); setInterval(() => { load(); wgload(); sbload(); }, 15000);
+load(); wgload(); subinit(); sbload(); awgload(); homeload(); setInterval(() => { load(); wgload(); sbload(); awgload(); homeload(); }, 15000);
 </script></body></html>
 """
 
@@ -978,6 +1261,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True, "url": m.get("url", ""), "updated": m.get("updated", 0)})
         if u.path == "/api/sb":
             return self._json(self.sb_info())
+        if u.path == "/api/awg":
+            return self._json(self.awg_info())
+        if u.path == "/api/home":
+            return self._json(self.home_info())
         if u.path == "/api/wg/config":
             pub = urllib.parse.parse_qs(u.query).get("p", [""])[0]
             pub = pub.replace(" ", "+")
@@ -1022,6 +1309,9 @@ class Handler(BaseHTTPRequestHandler):
             "/api/wg/delete": self.wg_del_ep,
             "/api/wg/settings": self.wg_settings_ep,
             "/api/sb/settings": self.sb_settings_ep,
+            "/api/awg/apply": self.awg_apply_ep,
+            "/api/awg/restart": self.awg_restart_ep,
+            "/api/priority": self.priority_ep,
             "/api/password": self.password_ep,
         }
         fn = routes.get(self.path)
@@ -1045,6 +1335,8 @@ class Handler(BaseHTTPRequestHandler):
         enabled = set(ut.get("outbounds") or [])
         auth = clash("/proxies/auto") or {}
         active = auth.get("now")
+        if active == "reserve":
+            active = (clash("/proxies/reserve") or {}).get("now", "")
         tags_meta = meta_load().get("tags", {})
         out = []
         for o in proxy_outbounds(d):
@@ -1056,17 +1348,20 @@ class Handler(BaseHTTPRequestHandler):
                 delay = None
             out.append({
                 "tag": tag,
-                "name": (tags_meta.get(tag) or {}).get("name") or tag,
+                "name": (tags_meta.get(tag) or {}).get("name") or ("Мой сервер (Amnezia)" if tag == AWG_TAG else tag),
                 "server": o.get("server"),
                 "server_port": o.get("server_port"),
-                "enabled": tag in enabled,
+                "enabled": tag in enabled or tag == AWG_TAG,
                 "active": tag == active,
+                "awg": tag == AWG_TAG,
                 "delay": delay,
             })
         return {"ok": True, "servers": out, "active": active}
 
     def toggle(self, body):
         tag = body.get("tag")
+        if tag == AWG_TAG:
+            return {"ok": False, "error": "узел Amnezia управляется в карточке Amnezia"}
         on = bool(body.get("enabled"))
         d = load()
         ut = urltest(d)
@@ -1085,6 +1380,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def delete(self, body):
         tag = body.get("tag")
+        if tag == AWG_TAG:
+            return {"ok": False, "error": "узел Amnezia управляется в карточке Amnezia"}
         d = load()
         ut = urltest(d)
         if ut and tag in (ut.get("outbounds") or []) and len(ut["outbounds"]) <= 1:
@@ -1185,6 +1482,51 @@ class Handler(BaseHTTPRequestHandler):
         if not res.get("ok"):
             return res
         return {"ok": True, "interval": iv, "tolerance": tol}
+    def awg_info(self):
+        st = awg_status()
+        st["ok"] = True
+        st["conf"] = awg_conf_text()
+        return st
+
+    def awg_apply_ep(self, body):
+        return awg_apply(body.get("conf"))
+
+    def awg_restart_ep(self, body):
+        ok, err = _awg_svc("restart")
+        if not ok:
+            return {"ok": False, "error": err}
+        time.sleep(5)
+        st = awg_status()
+        hs = "handshake есть" if st.get("handshake") else "туннель поднят, ждём handshake"
+        return {"ok": True, "status": hs}
+
+    def home_info(self):
+        d = load()
+        m = meta_load()
+        tags = m.get("tags", {})
+        auto = clash("/proxies/auto") or {}
+        now = auto.get("now", "")
+        if now == "reserve":
+            rsv = clash("/proxies/reserve") or {}
+            now = rsv.get("now", "")
+        po = {o.get("tag"): o for o in proxy_outbounds(d)}
+        now_name, now_delay = "", None
+        if now in po:
+            now_name = (tags.get(now) or {}).get("name") or ("Мой сервер (Amnezia)" if now == AWG_TAG else now)
+            info = clash("/proxies/" + urllib.parse.quote(now)) or {}
+            hist = info.get("history") or []
+            now_delay = hist[-1].get("delay") if hist else None
+        else:
+            now_name = now or "—"
+        return {"ok": True, "mode": priority_mode(), "now": now, "now_name": now_name,
+                "now_delay": now_delay, "awg": awg_status(), "nodes": len(po)}
+
+    def priority_ep(self, body):
+        return priority_set(body.get("mode"))
+
+
+
+
 
     def wg_settings_ep(self, body):
         ep = (body.get("endpoint") or "").strip()
@@ -1216,4 +1558,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    threading.Thread(target=priority_loop, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
